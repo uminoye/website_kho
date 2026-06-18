@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import LoginPage from './pages/LoginPage';
 import MainLayout from './layouts/MainLayout';
 import ProductsPage from './pages/ProductsPage';
@@ -44,7 +44,7 @@ const HomeRedirect = () => {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         
@@ -78,6 +78,6 @@ export default function App() {
 
         </Route>
       </Routes>
-    </BrowserRouter>
+    </HashRouter>
   );
 }

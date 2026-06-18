@@ -5,5 +5,5 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   // Quan trọng: Thay 'ten-repository-cua-ban' bằng đúng tên thư mục chứa code trên GitHub
-  base: '/inventory-management/', 
+  base: '/website_kho/', 
 })
