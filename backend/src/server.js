@@ -52,5 +52,6 @@ app.use((err, req, res, next) => {
 // --- 7. KHỞI CHẠY SERVER ---
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Server đang chạy ở cổng ${PORT}`);
+    console.log(`🚀 Server đang chạy tại: http://localhost:${PORT}`);
+    console.log(`📂 API Test: http://localhost:${PORT}/api/test`);
 });
