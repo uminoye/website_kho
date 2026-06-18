@@ -1,9 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import path from 'path'
 
+// https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
-  base: '/website_kho/',
-  root: path.resolve(__dirname, '..'),
+  // Quan trọng: Thay 'ten-repository-cua-ban' bằng đúng tên thư mục chứa code trên GitHub
+  base: '/inventory-management/', 
 })

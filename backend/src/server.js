@@ -21,6 +21,9 @@ const app = express();
 app.use(cors()); 
 app.use(express.json()); 
 
+// --- 3. SERVE STATIC FILES ---
+app.use('/uploads', express.static(path.resolve(__dirname, '../../uploads')));
+app.use(express.static(path.resolve(__dirname, '../dist')));
 
 // --- 4. ĐƯỜNG DẪN KIỂM TRA (TEST) ---
 app.get('/api/test', (req, res) => {
@@ -41,15 +44,19 @@ app.use('/api/outbounds', outboundRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/warehouses', warehouseRoutes);
 app.use('/api/uploads', uploadRoutes);
-app.use('/uploads', express.static(path.resolve(__dirname, '../../uploads')));
 
-// --- 6. XỬ LÝ LỖI (ERROR HANDLING) ---
+// --- 6. SPA FALLBACK - Trả về index.html cho các route không phải API ---
+app.get('*', (req, res) => {
+    res.sendFile(path.resolve(__dirname, '../dist/index.html'));
+});
+
+// --- 7. XỬ LÝ LỖI (ERROR HANDLING) ---
 app.use((err, req, res, next) => {
     console.error("🔥 LỖI HỆ THỐNG:", err.stack);
     res.status(500).json({ message: 'Đã có lỗi xảy ra trên server!', error: err.message });
 });
 
-// --- 7. KHỞI CHẠY SERVER ---
+// --- 8. KHỞI CHẠY SERVER ---
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy tại: http://localhost:${PORT}`);
