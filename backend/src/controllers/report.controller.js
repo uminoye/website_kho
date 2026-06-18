@@ -1,22 +1,16 @@
-const db = require('../config/database');
+const pool = require('../config/database');
 
 const toNumber = (value) => Number(value || 0);
 
-const dbGet = (sql, params = []) =>
-  new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row || {});
-    });
-  });
+const dbGet = async (sql, params = []) => {
+  const { rows } = await pool.query(sql, params);
+  return rows[0] || {};
+};
 
-const dbAll = (sql, params = []) =>
-  new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows || []);
-    });
-  });
+const dbAll = async (sql, params = []) => {
+  const { rows } = await pool.query(sql, params);
+  return rows || [];
+};
 
 const getDashboardStats = async (req, res) => {
   try {
@@ -41,31 +35,31 @@ const getDashboardStats = async (req, res) => {
     const [revenueRows, importRows, exportRows, lowStockRows, topSellingProducts, recentOrders, recentExports, recentImports] = await Promise.all([
       dbAll(`
         SELECT 
-          strftime('%Y-%m', COALESCE(o.actual_delivery_date, o.updated_at, o.created_at)) as month,
+          TO_CHAR(COALESCE(o.actual_delivery_date, o.updated_at, o.created_at), 'YYYY-MM') as month,
           COALESCE(SUM(oi.quantity * COALESCE(oi.unit_price, p.sale_price, 0)), 0) as revenue
         FROM sales_orders o
         JOIN sales_order_items oi ON oi.order_id = o.id
         LEFT JOIN products p ON p.id = oi.product_id
         WHERE o.status = 'completed' AND COALESCE(o.actual_delivery_date, o.updated_at, o.created_at) IS NOT NULL
-        GROUP BY strftime('%Y-%m', COALESCE(o.actual_delivery_date, o.updated_at, o.created_at))
+        GROUP BY TO_CHAR(COALESCE(o.actual_delivery_date, o.updated_at, o.created_at), 'YYYY-MM')
         ORDER BY month ASC
       `),
       dbAll(`
         SELECT 
-          strftime('%Y-%m', created_at) as month,
+          TO_CHAR(created_at, 'YYYY-MM') as month,
           COUNT(*) as total
         FROM production_receipts
         WHERE created_at IS NOT NULL
-        GROUP BY strftime('%Y-%m', created_at)
+        GROUP BY TO_CHAR(created_at, 'YYYY-MM')
         ORDER BY month ASC
       `),
       dbAll(`
         SELECT 
-          strftime('%Y-%m', export_date) as month,
+           TO_CHAR(export_date, 'YYYY-MM') as month,
           COUNT(*) as total
         FROM stock_outbound_notes
         WHERE export_date IS NOT NULL
-        GROUP BY strftime('%Y-%m', export_date)
+        GROUP BY TO_CHAR(export_date, 'YYYY-MM')
         ORDER BY month ASC
       `),
       dbAll(`
@@ -188,7 +182,7 @@ const getDashboardStats = async (req, res) => {
   }
 };
 
-const getInventoryReport = (req, res) => {
+const getInventoryReport = async (req, res) => {
   const query = `
     SELECT 
       p.sku, 
@@ -205,10 +199,12 @@ const getInventoryReport = (req, res) => {
     ORDER BY w.name, p.name
   `;
 
-  db.all(query, [], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Lỗi lấy báo cáo', error: err.message });
+ try {
+    const { rows } = await pool.query(query);
     res.status(200).json(rows);
-  });
+    } catch (err) {
+    res.status(500).json({ message: 'Lỗi lấy báo cáo', error: err.message });
+  }
 };
 
 module.exports = { getDashboardStats, getInventoryReport };

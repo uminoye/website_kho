@@ -1,9 +1,9 @@
-const db = require('../config/database');
+const pool = require('../config/database');
 
 // =====================================================================
 // 1. LẤY DANH SÁCH PHIẾU XUẤT (Để xem lịch sử)
 // =====================================================================
-const getAllOutbounds = (req, res) => {
+const getAllOutbounds = async (req, res) => {
     const query = `
         SELECT
             o.id,
@@ -30,16 +30,18 @@ const getAllOutbounds = (req, res) => {
             w.warehouse_code AS warehouse_code,
             u.full_name AS creator_name,
             COALESCE(SUM(soi.quantity * COALESCE(soi.unit_price, 0)), 0) AS total_amount,
-            COALESCE(json_group_array(
-                CASE WHEN soi.id IS NOT NULL THEN json_object(
+             COALESCE(
+                JSON_AGG(
+                    JSON_BUILD_OBJECT(
                     'id', soi.id,
                     'product_id', soi.product_id,
                     'product_name', p.name,
                     'product_sku', p.sku,
                     'quantity', soi.quantity,
                     'unit_price', COALESCE(soi.unit_price, 0)
-                ) END
-            ), '[]') AS items
+                 )
+                ) FILTER (WHERE soi.id IS NOT NULL), '[]'::json
+            ) AS items
         FROM stock_outbound_notes o
         LEFT JOIN warehouses w ON o.warehouse_id = w.id
         LEFT JOIN users u ON o.created_by = u.id
@@ -47,21 +49,20 @@ const getAllOutbounds = (req, res) => {
         LEFT JOIN customers c ON s.customer_id = c.id
         LEFT JOIN stock_outbound_note_items soi ON o.id = soi.outbound_note_id
         LEFT JOIN products p ON soi.product_id = p.id
-        GROUP BY o.id
+        GROUP BY o.id, s.id, c.id, w.id, u.id
         ORDER BY o.id DESC
     `;
 
-    db.all(query, [], (err, rows) => {
-        if (err) return res.status(500).json({ message: 'Lỗi lấy danh sách', error: err.message });
+    try {
+        const { rows } = await pool.query(query);
 
         const parsedRows = rows.map((row) => {
-            let items = [];
-            try {
-                const parsed = JSON.parse(row.items || '[]');
-                items = parsed.filter((item) => item && item.id != null);
-            } catch (parseError) {
-                items = [];
+            let items = Array.isArray(row.items) ? row.items : [];
+            if (typeof row.items === 'string') {
+                try { items = JSON.parse(row.items); } catch (e) { }
             }
+            items = items.filter((item) => item && item.id != null);
+
 
             return {
                 id: row.id,
@@ -85,131 +86,86 @@ const getAllOutbounds = (req, res) => {
         });
 
         res.status(200).json(parsedRows);
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Lỗi lấy danh sách', error: err.message });
+    }
 };
 
 // =====================================================================
 // 2. THỦ KHO XÁC NHẬN XUẤT KHO (Backend tự tìm sản phẩm để trừ)
-// =====================================================================
-const createOutbound = (req, res) => {
+const createOutbound = async (req, res) => {
     const { outbound_no, order_id, warehouse_id, export_date, note } = req.body;
     const created_by = req.user?.id || 1;
 
     if (!order_id || !warehouse_id) return res.status(400).json({ message: 'Thiếu thông tin đơn hàng hoặc kho xuất!' });
 
-    // BƯỚC 1: BACKEND TỰ ĐỘNG ĐI TÌM DANH SÁCH MÓN HÀNG CỦA ĐƠN NÀY
-    db.all(
-        `SELECT soi.product_id, soi.quantity, COALESCE(soi.unit_price, p.sale_price, 0) AS unit_price, p.name, p.sku
-         FROM sales_order_items soi
-         LEFT JOIN products p ON soi.product_id = p.id
-         WHERE soi.order_id = ?`,
-        [order_id],
-        (err, items) => {
-            if (err || items.length === 0) return res.status(400).json({ message: 'Không tìm thấy chi tiết sản phẩm của đơn hàng này!' });
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
 
-            // BƯỚC 2: Kiểm tra tồn kho của TẤT CẢ sản phẩm trước khi xuất
-            const checkStockQueries = items.map(item => {
-                return new Promise((resolve, reject) => {
-                    db.get(
-                        `SELECT b.on_hand_qty, p.name FROM inventory_balances b JOIN products p ON b.product_id = p.id WHERE b.product_id = ? AND b.warehouse_id = ?`,
-                        [item.product_id, warehouse_id],
-                        (err, row) => {
-                            const stock = row ? row.on_hand_qty : 0;
-                            if (stock < item.quantity) {
-                                reject(`Sản phẩm [${row ? row.name : 'ID:' + item.product_id}] chỉ còn ${stock} cái, không đủ để xuất ${item.quantity} cái!`);
-                            } else {
-                                resolve();
-                            }
-                        }
-                    );
-                });
-            });
+        const { rows: items } = await client.query(
+            `SELECT soi.product_id, soi.quantity, COALESCE(soi.unit_price, p.sale_price, 0) AS unit_price, p.name, p.sku
+             FROM sales_order_items soi
+             LEFT JOIN products p ON soi.product_id = p.id
+             WHERE soi.order_id = $1`,
+            [order_id]
+        );
 
-            // BƯỚC 3: Nếu tất cả đều đủ hàng mới chạy Transaction trừ kho
-            Promise.all(checkStockQueries)
-                .then(() => {
-                    db.serialize(() => {
-                        db.run("BEGIN TRANSACTION");
+        if (!items || items.length === 0) throw new Error('Không tìm thấy chi tiết sản phẩm của đơn hàng này!');
+        for (const item of items) {
+            const { rows: stockRows } = await client.query(
+                `SELECT b.on_hand_qty, p.name FROM inventory_balances b JOIN products p ON b.product_id = p.id WHERE b.product_id = $1 AND b.warehouse_id = $2`,
+                [item.product_id, warehouse_id]
+            );
+            const stock = stockRows.length > 0 ? stockRows[0].on_hand_qty : 0;
+            if (stock < item.quantity) {
+                throw new Error(`Sản phẩm [${stockRows.length > 0 ? stockRows[0].name : 'ID:' + item.product_id}] chỉ còn ${stock} cái, không đủ để xuất ${item.quantity} cái!`);
+            }
+        }
 
-                        db.run(`INSERT INTO stock_outbound_notes (outbound_no, order_id, warehouse_id, export_date, created_by, note, status) VALUES (?, ?, ?, ?, ?, ?, 'completed')`,
-                            [outbound_no, order_id, warehouse_id, export_date, created_by, note],
-                            function (err) {
-                                if (err) { db.run("ROLLBACK"); return res.status(400).json({ message: 'Lỗi tạo mã phiếu xuất!' }); }
+        const outResult = await client.query(
+            `INSERT INTO stock_outbound_notes (outbound_no, order_id, warehouse_id, export_date, created_by, note, status) VALUES ($1, $2, $3, $4, $5, $6, 'completed') RETURNING id`,
+            [outbound_no, order_id, warehouse_id, export_date, created_by, note]
+        );
+        const outboundId = outResult.rows[0].id;
 
-                                const outboundId = this.lastID;
-                                let completedItems = 0;
-                                let hasError = false;
+        for (const item of items) {
+            await client.query(
+                `INSERT INTO stock_outbound_note_items (outbound_note_id, product_id, quantity) VALUES ($1, $2, $3)`,
+                [outboundId, item.product_id, item.quantity]
+            );
 
-                                const itemsToInsert = items.map(item => ({
-                                    product_id: item.product_id,
-                                    quantity: item.quantity,
-                                    unit_price: item.unit_price ?? 0,
-                                }));
+            const updateRes = await client.query(
+                `UPDATE inventory_balances SET on_hand_qty = on_hand_qty - $1, updated_at = CURRENT_TIMESTAMP WHERE warehouse_id = $2 AND product_id = $3`,
+                [item.quantity, warehouse_id, item.product_id]
+            );
 
-                                const processItem = (index) => {
-                                    if (index >= itemsToInsert.length) {
-                                        db.run(`UPDATE sales_orders SET status = 'shipping', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [order_id]);
-                                        db.run("COMMIT");
-                                        return res.status(201).json({ message: 'Xuất kho thành công! Đã trừ tồn và cập nhật đơn hàng.', outbound_id: outboundId });
-                                    }
+            if (updateRes.rowCount === 0) {
+                throw new Error('Lỗi cập nhật tồn kho: chưa có dòng tồn kho hoặc không đủ điều kiện cập nhật!');
+            }
 
-                                    const item = itemsToInsert[index];
-                                    db.run(
-                                        `INSERT INTO stock_outbound_note_items (outbound_note_id, product_id, quantity)
-                                     VALUES (?, ?, ?)`,
-                                        [outboundId, item.product_id, item.quantity],
-                                        function (err) {
-                                            if (err) {
-                                                hasError = true;
-                                                db.run("ROLLBACK");
-                                                return res.status(500).json({ message: 'Lỗi lưu chi tiết phiếu xuất!' });
-                                            }
+            await client.query(
+                `INSERT INTO inventory_transactions (warehouse_id, product_id, transaction_type, quantity, reference_type, reference_id) VALUES ($1, $2, 'OUT', $3, 'stock_outbound', $4)`,
+                [warehouse_id, item.product_id, item.quantity, outboundId]
+            );
+        }
 
-                                            db.run(
-                                                `UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, updated_at = CURRENT_TIMESTAMP WHERE warehouse_id = ? AND product_id = ?`,
-                                                [item.quantity, warehouse_id, item.product_id],
-                                                function (err) {
-                                                    if (err || this.changes === 0) {
-                                                        hasError = true;
-                                                        db.run("ROLLBACK");
-                                                        return res.status(500).json({ message: 'Lỗi cập nhật tồn kho: chưa có dòng tồn kho hoặc không đủ điều kiện cập nhật!' });
-                                                    }
+        await client.query(`UPDATE sales_orders SET status = 'shipping', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [order_id]);
 
-                                                    db.run(
-                                                        `INSERT INTO inventory_transactions (warehouse_id, product_id, transaction_type, quantity, reference_type, reference_id) VALUES (?, ?, 'OUT', ?, 'stock_outbound', ?)`,
-                                                        [warehouse_id, item.product_id, item.quantity, outboundId],
-                                                        function (err) {
-                                                            if (err) {
-                                                                hasError = true;
-                                                                db.run("ROLLBACK");
-                                                                return res.status(500).json({ message: 'Lỗi ghi lịch sử giao dịch!' });
-                                                            }
-
-                                                            completedItems++;
-                                                            processItem(index + 1);
-                                                        }
-                                                    );
-                                                }
-                                            );
-                                        }
-                                    );
-                                };
-
-                                processItem(0);
-                            }
-                        );
-                    });
-                })
-                .catch(errorMsg => {
-                    res.status(400).json({ message: errorMsg }); // Báo lỗi thiếu hàng
-                });
-        });
+        await client.query("COMMIT");
+        return res.status(201).json({ message: 'Xuất kho thành công! Đã trừ tồn và cập nhật đơn hàng.', outbound_id: outboundId });
+    } catch (err) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: err.message || 'Lỗi xử lý xuất kho' });
+    } finally {
+        client.release();
+    }
 };
 
 // =====================================================================
 // 3. HÀM PHẢN HỒI: TỪ CHỐI HOẶC HẸN NGÀY (Khi thiếu hàng)
 // =====================================================================
-const respondOutbound = (req, res) => {
+const respondOutbound = async (req, res) => {
     const { order_id } = req.params;
     const { action, reason, expected_date } = req.body;
 
@@ -217,26 +173,31 @@ const respondOutbound = (req, res) => {
     const notePrefix = action === 'reject' ? '[KHO TỪ CHỐI]' : '[KHO HẸN GIAO]';
     const finalNote = `${notePrefix}: ${reason}`;
 
-    db.run(
-        `UPDATE sales_orders SET status = ?, note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-        [newStatus, finalNote, order_id],
-        (err) => {
-            if (err) return res.status(500).json({ message: 'Lỗi cập nhật phản hồi' });
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        await client.query(
+            `UPDATE sales_orders SET status = $1, note = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+            [newStatus, finalNote, order_id]
+        );
 
-            db.run(
-                `INSERT INTO delivery_requests (order_id, status, logistics_note, warehouse_note, updated_at)
-                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-                [order_id, newStatus, reason || null, expected_date || null],
-                (err2) => {
-                    if (err2) console.error('Lỗi lưu delivery_requests:', err2.message);
-                    res.status(200).json({ message: 'Đã gửi phản hồi từ Kho thành công!' });
-                }
-            );
-        }
-    );
+        await client.query(
+            `INSERT INTO delivery_requests (order_id, status, logistics_note, warehouse_note, updated_at)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+            [order_id, newStatus, reason || null, expected_date || null]
+        );
+        await client.query("COMMIT");
+        res.status(200).json({ message: 'Đã gửi phản hồi từ Kho thành công!' });
+    } catch (err) {
+        await client.query("ROLLBACK");
+        res.status(500).json({ message: 'Lỗi cập nhật phản hồi', error: err.message });
+    } finally {
+        client.release();
+    }
 };
 
-const getPendingOutboundRequests = (req, res) => {
+
+const getPendingOutboundRequests = async (req, res) => {
     const query = `
         SELECT
             s.id,
@@ -255,16 +216,18 @@ const getPendingOutboundRequests = (req, res) => {
             c.phone AS customer_phone,
             c.address AS customer_address,
             COALESCE(SUM(soi.quantity * COALESCE(soi.unit_price, p.sale_price, 0)), 0) AS total_amount,
-            COALESCE(json_group_array(
-                CASE WHEN soi.id IS NOT NULL THEN json_object(
+                    COALESCE(
+                JSON_AGG(
+                    JSON_BUILD_OBJECT(
                     'id', soi.id,
                     'product_id', soi.product_id,
                     'product_name', p.name,
                     'product_sku', p.sku,
                     'quantity', soi.quantity,
                     'unit_price', COALESCE(soi.unit_price, p.sale_price, 0)
-                ) END
-            ), '[]') AS items,
+                 )
+                ) FILTER (WHERE soi.id IS NOT NULL), '[]'::json
+            ) AS items,
             (
                 SELECT d.status
                 FROM delivery_requests d
@@ -320,17 +283,17 @@ const getPendingOutboundRequests = (req, res) => {
                 WHERE d.order_id = s.id
                     AND COALESCE(d.status, '') IN ('warehouse_processing', 'shipping', 'completed', 'returned', 'canceled')
             )
-        GROUP BY s.id
+        GROUP BY s.id, c.id
         ORDER BY s.updated_at DESC, s.id DESC
     `;
 
-    db.all(query, [], (err, rows) => {
-        if (err) return res.status(500).json({ message: 'Lỗi lấy danh sách đơn chờ xuất', error: err.message });
-
+    try {
+        const { rows } = await pool.query(query);
         const parsedRows = rows.map((row) => {
             let items = [];
             try {
-                items = JSON.parse(row.items || '[]').filter((item) => item && item.id != null);
+                  let rawItems = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+                items = (rawItems || []).filter((item) => item && item.id != null);
             } catch (e) {
                 items = [];
             }
@@ -362,95 +325,77 @@ const getPendingOutboundRequests = (req, res) => {
         });
 
         res.status(200).json(parsedRows);
-    });
+  } catch (err) {
+        res.status(500).json({ message: 'Lỗi lấy danh sách đơn chờ xuất', error: err.message });
+    }
 };
 
-const createOutboundFromPending = (req, res) => {
+const createOutboundFromPending = async (req, res) => {
     const { order_id, warehouse_id, export_date, note } = req.body;
     const created_by = req.user?.id || 1;
 
     if (!order_id || !warehouse_id) return res.status(400).json({ message: 'Thiếu thông tin đơn hàng hoặc kho xuất!' });
 
-    db.all(
-        `SELECT soi.product_id, soi.quantity, COALESCE(soi.unit_price, p.sale_price, 0) AS unit_price
-         FROM sales_order_items soi
-         LEFT JOIN products p ON soi.product_id = p.id
-         WHERE soi.order_id = ?`,
-        [order_id],
-        (err, items) => {
-            if (err || items.length === 0) return res.status(400).json({ message: 'Không tìm thấy chi tiết sản phẩm của đơn hàng này!' });
+     const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+            const { rows: items } = await client.query(
+            `SELECT soi.product_id, soi.quantity, COALESCE(soi.unit_price, p.sale_price, 0) AS unit_price
+             FROM sales_order_items soi
+             LEFT JOIN products p ON soi.product_id = p.id
+             WHERE soi.order_id = $1`,
+            [order_id]
+        );
 
-            const checkStockQueries = items.map(item => new Promise((resolve, reject) => {
-                db.get(
-                    `SELECT b.on_hand_qty, p.name FROM inventory_balances b JOIN products p ON b.product_id = p.id WHERE b.product_id = ? AND b.warehouse_id = ?`,
-                    [item.product_id, warehouse_id],
-                    (stockErr, row) => {
-                        const stock = row ? row.on_hand_qty : 0;
-                        if (stock < item.quantity) reject(`Sản phẩm [${row ? row.name : 'ID:' + item.product_id}] chỉ còn ${stock} cái, không đủ để xuất ${item.quantity} cái!`);
-                        else resolve();
-                    }
-                );
-            }));
+        if (!items || items.length === 0) throw new Error('Không tìm thấy chi tiết sản phẩm của đơn hàng này!');
 
-            Promise.all(checkStockQueries)
-                .then(() => {
-                    db.serialize(() => {
-                        db.run('BEGIN TRANSACTION');
-                        db.run(
-                            `INSERT INTO stock_outbound_notes (outbound_no, order_id, warehouse_id, export_date, created_by, note, status)
-                             VALUES (?, ?, ?, ?, ?, ?, 'completed')`,
-                            [`XK-${Date.now()}`, order_id, warehouse_id, export_date || new Date().toISOString().split('T')[0], created_by, note || null],
-                            function (insertErr) {
-                                if (insertErr) {
-                                    db.run('ROLLBACK');
-                                    return res.status(400).json({ message: 'Lỗi tạo mã phiếu xuất!', error: insertErr.message });
-                                }
-
-                                const outboundId = this.lastID;
-                                let processed = 0;
-                                let hasError = false;
-
-                                items.forEach((item) => {
-                                    db.run(
-                                        `INSERT INTO stock_outbound_note_items (outbound_note_id, product_id, quantity) VALUES (?, ?, ?)`,
-                                        [outboundId, item.product_id, item.quantity],
-                                        (itemErr) => { if (itemErr) hasError = true; }
-                                    );
-
-                                    db.run(
-                                        `UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, updated_at = CURRENT_TIMESTAMP WHERE warehouse_id = ? AND product_id = ?`,
-                                        [item.quantity, warehouse_id, item.product_id],
-                                        (invErr) => { if (invErr) hasError = true; }
-                                    );
-
-                                    db.run(
-                                        `INSERT INTO inventory_transactions (warehouse_id, product_id, transaction_type, quantity, reference_type, reference_id)
-                                         VALUES (?, ?, 'OUT', ?, 'stock_outbound', ?)`,
-                                        [warehouse_id, item.product_id, item.quantity, outboundId],
-                                        (txErr) => {
-                                            if (txErr) hasError = true;
-                                            processed += 1;
-
-                                            if (processed === items.length) {
-                                                if (hasError) {
-                                                    db.run('ROLLBACK');
-                                                    return res.status(500).json({ message: 'Lỗi trừ tồn kho hoặc lưu chi tiết phiếu xuất!' });
-                                                }
-
-                                                db.run(`UPDATE sales_orders SET status = 'shipping', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [order_id]);
-                                                db.run('COMMIT');
-                                                return res.status(201).json({ message: 'Xuất kho thành công! Đã trừ tồn và cập nhật đơn hàng.', outbound_id: outboundId });
-                                            }
-                                        }
-                                    );
-                                });
-                            }
-                        );
-                    });
-                })
-                .catch(errorMsg => res.status(400).json({ message: errorMsg }));
+        for (const item of items) {
+            const { rows: stockRows } = await client.query(
+                `SELECT b.on_hand_qty, p.name FROM inventory_balances b JOIN products p ON b.product_id = p.id WHERE b.product_id = $1 AND b.warehouse_id = $2`,
+                [item.product_id, warehouse_id]
+            );
+            const stock = stockRows.length > 0 ? stockRows[0].on_hand_qty : 0;
+            if (stock < item.quantity) {
+                throw new Error(`Sản phẩm [${stockRows.length > 0 ? stockRows[0].name : 'ID:' + item.product_id}] chỉ còn ${stock} cái, không đủ để xuất ${item.quantity} cái!`);
+            }
         }
-    );
+
+        const outResult = await client.query(
+            `INSERT INTO stock_outbound_notes (outbound_no, order_id, warehouse_id, export_date, created_by, note, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'completed') RETURNING id`,
+            [`XK-${Date.now()}`, order_id, warehouse_id, export_date || new Date().toISOString().split('T')[0], created_by, note || null]
+        );
+        const outboundId = outResult.rows[0].id;
+
+        for (const item of items) {
+            await client.query(
+                `INSERT INTO stock_outbound_note_items (outbound_note_id, product_id, quantity) VALUES ($1, $2, $3)`,
+                [outboundId, item.product_id, item.quantity]
+            );
+
+            await client.query(
+                `UPDATE inventory_balances SET on_hand_qty = on_hand_qty - $1, updated_at = CURRENT_TIMESTAMP WHERE warehouse_id = $2 AND product_id = $3`,
+                [item.quantity, warehouse_id, item.product_id]
+            );
+
+            await client.query(
+                `INSERT INTO inventory_transactions (warehouse_id, product_id, transaction_type, quantity, reference_type, reference_id)
+                 VALUES ($1, $2, 'OUT', $3, 'stock_outbound', $4)`,
+                [warehouse_id, item.product_id, item.quantity, outboundId]
+            );
+        }
+
+        await client.query(`UPDATE sales_orders SET status = 'shipping', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [order_id]);
+
+        await client.query("COMMIT");
+        return res.status(201).json({ message: 'Xuất kho thành công! Đã trừ tồn và cập nhật đơn hàng.', outbound_id: outboundId });
+
+    } catch (err) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: err.message || 'Lỗi trừ tồn kho hoặc lưu chi tiết phiếu xuất!' });
+    } finally {
+        client.release();
+    }
 };
 
 const createOutboundFallback = (req, res) => {
