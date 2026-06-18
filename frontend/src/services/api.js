@@ -26,7 +26,8 @@ api.interceptors.response.use(
     if (error.response && error.response.status === 401) {
       localStorage.removeItem('accessToken');
       localStorage.removeItem('user');
-      window.location.href = '/login';
+      // Sửa lại thành window.location.hash để tương thích với HashRouter trên GitHub Pages
+      window.location.hash = '/login';
     }
     return Promise.reject(error);
   }
