@@ -1,13 +1,15 @@
-const db = require('../config/database');
+const pool = require('../config/database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-// 1. ĐĂNG NHẬP (Giữ nguyên của bà vì nó chuẩn rồi)
-const login = (req, res) => {
+// 1. ĐĂNG NHẬP
+const login = async (req, res) => {
     const { email, password } = req.body;
 
-    db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
-        if (err) return res.status(500).json({ message: 'Lỗi máy chủ', error: err.message });
+    try {
+        const { rows } = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+        const user = rows[0];
+        
         if (!user) return res.status(404).json({ message: 'Tài khoản không tồn tại' });
 
         const passwordIsValid = bcrypt.compareSync(password, user.password_hash);
@@ -29,71 +31,79 @@ const login = (req, res) => {
             },
             accessToken: token
         });
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Lỗi máy chủ', error: err.message });
+    }
 };
 
-// 2. LẤY DANH SÁCH (Sửa lại tìm kiếm theo cột email)
-const getAllUsers = (req, res) => {
-    const query = `SELECT id, email, full_name, role_id FROM users ORDER BY id DESC`;
-    db.all(query, [], (err, rows) => {
-        if (err) return res.status(500).json({ message: 'Lỗi Database: ' + err.message });
+// 2. LẤY DANH SÁCH
+const getAllUsers = async (req, res) => {
+    try {
+        const query = `SELECT id, email, full_name, role_id FROM users ORDER BY id DESC`;
+        const { rows } = await pool.query(query);
         res.status(200).json(rows);
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Lỗi Database: ' + err.message });
+    }
 };
 
-// 3. TẠO TÀI KHOẢN (Mã hóa mật khẩu & Dùng email)
-const createUser = (req, res) => {
+// 3. TẠO TÀI KHOẢN
+const createUser = async (req, res) => {
     const { email, password, full_name, role_id } = req.body;
     if (!email || !password || !full_name) return res.status(400).json({ message: 'Vui lòng nhập đủ thông tin!' });
 
-    // CỰC KỲ QUAN TRỌNG: Phải mã hóa password thì hàm Login mới hiểu được
     const hashed_password = bcrypt.hashSync(password, 10);
 
-    const query = `INSERT INTO users (email, password_hash, full_name, role_id) VALUES (?, ?, ?, ?)`;
-    db.run(query, [email, hashed_password, full_name, role_id || 2], function(err) {
-        if (err) {
-            if (err.message.includes('UNIQUE')) return res.status(400).json({ message: 'Email này đã được sử dụng!' });
-            return res.status(500).json({ message: 'Lỗi khi tạo tài khoản' });
-        }
+    const query = `INSERT INTO users (email, password_hash, full_name, role_id) VALUES ($1, $2, $3, $4)`;
+    try {
+        await pool.query(query, [email, hashed_password, full_name, role_id || 2]);
         res.status(201).json({ message: 'Tạo tài khoản thành công!' });
-    });
+    } catch (err) {
+        if (err.code === '23505') return res.status(400).json({ message: 'Email này đã được sử dụng!' });
+        res.status(500).json({ message: 'Lỗi khi tạo tài khoản' });
+    }
 };
 
 // 4. SỬA TÀI KHOẢN
-const updateUser = (req, res) => {
+const updateUser = async (req, res) => {
     const { id } = req.params;
     const { full_name, role_id, password } = req.body;
 
-    let query = `UPDATE users SET full_name = ?, role_id = ?`;
+    let query = `UPDATE users SET full_name = $1, role_id = $2`;
     let params = [full_name, role_id];
+    let paramIndex = 3;
 
-    // Nếu Admin nhập pass mới -> Mã hóa pass mới đó rồi lưu vào cột password_hash
     if (password) {
-        query += `, password_hash = ?`;
+        query += `, password_hash = $${paramIndex++}`;
         params.push(bcrypt.hashSync(password, 10)); 
     }
     
-    query += ` WHERE id = ?`;
+    query += ` WHERE id = $${paramIndex}`;
     params.push(id);
 
-    db.run(query, params, function(err) {
-        if (err) return res.status(500).json({ message: 'Lỗi khi cập nhật tài khoản' });
+    try {
+        await pool.query(query, params);
         res.status(200).json({ message: 'Cập nhật thành công!' });
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Lỗi khi cập nhật tài khoản' });
+    }
 };
 
 // 5. XÓA TÀI KHOẢN
-const deleteUser = (req, res) => {
+const deleteUser = async (req, res) => {
     const { id } = req.params;
-    db.get(`SELECT role_id FROM users WHERE id = ?`, [id], (err, user) => {
+    try {
+        const { rows } = await pool.query(`SELECT role_id FROM users WHERE id = $1`, [id]);
+        const user = rows[0];
         if (user && user.role_id === 1) {
             return res.status(400).json({ message: 'Tuyệt đối không được xóa tài khoản Admin gốc!' });
         }
-        db.run(`DELETE FROM users WHERE id = ?`, [id], function(err) {
-            if (err) return res.status(500).json({ message: 'Lỗi khi xóa tài khoản' });
-            res.status(200).json({ message: 'Đã xóa tài khoản nhân viên!' });
-        });
-    });
+        
+        await pool.query(`DELETE FROM users WHERE id = $1`, [id]);
+        res.status(200).json({ message: 'Đã xóa tài khoản nhân viên!' });
+    } catch (err) {
+        res.status(500).json({ message: 'Lỗi khi xóa tài khoản' });
+    }
 };
 
 module.exports = { login, getAllUsers, createUser, updateUser, deleteUser };

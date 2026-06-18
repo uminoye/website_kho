@@ -1,0 +1,18 @@
+# Các thư mục thư viện tải về (Rất nặng)
+**/node_modules/
+
+# Các thư mục code đã build thành web tĩnh
+**/dist/
+
+# Bộ nhớ đệm (Cache của gh-pages)
+**/.cache/
+
+# Thư mục chứa ảnh/file do người dùng tải lên
+**/uploads/
+
+# Biến môi trường
+.env
+
+# File rác của hệ điều hành
+.DS_Store
+Thumbs.db
