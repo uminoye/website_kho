@@ -23,7 +23,6 @@ app.use(express.json());
 
 // --- 3. SERVE STATIC FILES ---
 app.use('/uploads', express.static(path.resolve(__dirname, '../../uploads')));
-app.use(express.static(path.resolve(__dirname, '../dist')));
 
 // --- 4. ĐƯỜNG DẪN KIỂM TRA (TEST) ---
 app.get('/api/test', (req, res) => {
@@ -45,9 +44,9 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/warehouses', warehouseRoutes);
 app.use('/api/uploads', uploadRoutes);
 
-// --- 6. SPA FALLBACK - Trả về index.html cho các route không phải API ---
+// --- 6. FALLBACK ROUTE - Xử lý các đường dẫn không tồn tại ---
 app.get('*', (req, res) => {
-    res.sendFile(path.resolve(__dirname, '../dist/index.html'));
+    res.status(404).json({ message: 'Backend API đang chạy! Đây không phải là đường dẫn hợp lệ.' });
 });
 
 // --- 7. XỬ LÝ LỖI (ERROR HANDLING) ---

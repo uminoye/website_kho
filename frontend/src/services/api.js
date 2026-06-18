@@ -1,8 +1,8 @@
 import axios from 'axios';
 
-// Kết nối với cổng 5000 của Backend
+// Kết nối với Backend trên Render
 const api = axios.create({
-  baseURL: 'http://localhost:5000/api', 
+  baseURL: 'https://website-kho.onrender.com/api', 
 });
 
 // Tự động gắn thẻ Token vào mỗi lần gọi API nếu đã đăng nhập
